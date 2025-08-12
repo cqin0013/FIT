@@ -222,6 +222,80 @@ async function getRange(start, end, { limit = 100000 } = {}) {
   return rows.map(mapParkingRow);
 }
 
+
+/* ===================================================================================
+ * 实时版（精简）：只取最新 limit 条（默认 2000），不做距离过滤
+ * 来源：LIVE_PARKING_API_URL（可用参数 url 覆盖），LIVE_PARKING_API_TOKEN 可选
+ * 返回结构与 mapParkingRow 一致：{ bayId, unoccupied, occupied, lat, lon, lastupdated, timestamp }
+ * =================================================================================== */
+async function fetchLiveLatest({ limit = 2000, url, token } = {}) {
+  const endpoint = url || process.env.LIVE_PARKING_API_URL;
+  if (!endpoint) throw new Error("LIVE_PARKING_API_URL 未配置，且未通过参数提供 url");
+
+  // 常见 Socrata 风格：$limit + $order
+  const q = new URL(endpoint);
+  if (!q.searchParams.has("$limit")) q.searchParams.set("$limit", String(Math.max(1, Math.min(50000, limit))));
+  if (!q.searchParams.has("$order")) q.searchParams.set("$order", "lastupdated DESC");
+
+  const res = await fetch(q.toString(), {
+    headers: token ? { "X-App-Token": token } : undefined,
+    timeout: 15000,
+  });
+  if (!res.ok) throw new Error(`实时接口请求失败：${res.status} ${res.statusText}`);
+  const raw = await res.json();
+
+  // 小工具：从多个备选字段中取第一个有效值
+  const firstOf = (obj, keys, fallback = null) => {
+    for (const k of keys) {
+      if (obj[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== "") return obj[k];
+    }
+    return fallback;
+  };
+
+  const LAT_RE = /-?\d+\.\d+/g; // 兜底从描述里扒坐标
+  const rows = [];
+
+  for (const r of Array.isArray(raw) ? raw : []) {
+    // 1) 状态规范化（兼容不同字段名）
+    const rawStatus = firstOf(r, ["Zone_Number", "zone_number", "Status", "status", "Status_Description", "status_description"]);
+    const unocc = normalizeUnoccupied(rawStatus);
+    const occ = unocc == null ? null : !unocc;
+
+    // 2) 坐标：字段优先，否则从 Status_Description 正则提取
+    let lat = firstOf(r, ["lat", "latitude", "Latitude"]);
+    let lon = firstOf(r, ["lon", "longitude", "Longitude"]);
+    if ((lat == null || lon == null) && r.Status_Description) {
+      const m = String(r.Status_Description).match(LAT_RE) || [];
+      if (m.length >= 2) { lat = Number(m[0]); lon = Number(m[1]); }
+    }
+    lat = lat != null ? Number(lat) : null;
+    lon = lon != null ? Number(lon) : null;
+    if (lat == null || lon == null) continue; // 无坐标就跳过
+
+    // 3) 其它字段
+    const bayId = firstOf(r, ["KerbsideID", "kerbsideid", "bay_id", "bayId"]) || makePseudoId(lat, lon);
+    const lastupdated = firstOf(r, ["Lastupdated", "lastupdated", "status_timestamp", "status_time", "updated", "update_time"]);
+
+    rows.push({
+      bayId: String(bayId),
+      unoccupied: unocc,
+      occupied: occ,
+      lat,
+      lon,
+      lastupdated: lastupdated || null,
+      timestamp: new Date().toISOString(),
+    });
+
+    if (rows.length >= limit) break; // 双保险
+  }
+
+  return rows;
+}
+
+
+
+
+
 /* ===================================================================================
  * B. 其它保留的辅助
  * =================================================================================== */
@@ -331,4 +405,6 @@ module.exports = {
   // 指标
   metricsCbdPopulation,
   metricsCarOwnership,
+// 新增：实时直连，最新 N 条
+  fetchLiveLatest,
 };

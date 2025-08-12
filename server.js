@@ -60,37 +60,20 @@ app.get("/api/metrics/cbd-population", async (req, res) => {
 
 /* ===================== 停车（数据库解析坐标版） ===================== */
 
-// 实时数据（访问时可 no-op 触发 ensureFreshIngest）
+// 实时：只读最新 N 条（默认 2000），不做 near/radius 过滤
 app.get("/api/parking", async (req, res) => {
   try {
-    await handler.ensureFreshIngest({ ttlSec: 90 });
-
-    let out = await handler.fetchOnce({ limit: 2000 });
-
-    // onlyAvailable: DB 无占用状态，暂不生效（不做过滤）
-    if (req.query.onlyAvailable === "true") {
-      // out = out.filter(r => r.unoccupied); // DB 中为 null，这里不做过滤
-    }
-
-    // 近点过滤
-    const { near, radius } = req.query;
-    if (near && radius) {
-      const [latStr = "", lonStr = ""] = String(near).replace(/，/g, ",").split(",");
-      const lat = parseFloat(latStr.replace(/[^\d.\-]/g, ""));
-      const lon = parseFloat(lonStr.replace(/[^\d.\-]/g, ""));
-      const r = Number(radius);
-      if (Number.isFinite(lat) && Number.isFinite(lon) && Number.isFinite(r)) {
-        out = out.filter(
-          (p) => p.lat != null && p.lon != null && haversine(p.lat, p.lon, lat, lon) <= r
-        );
-      }
-    }
-
-    res.json(out);
+    const limit = Number(req.query.limit || 2000);
+    const data = await handler.fetchLiveLatest({ limit });
+    res.json(data);
   } catch (e) {
     res.status(500).json({ error: "Server error", detail: e.message });
   }
 });
+
+
+
+
 
 // 历史
 app.get("/api/parking-history", async (req, res) => {
