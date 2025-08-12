@@ -83,7 +83,7 @@ vishnu.allurihimavardhana@monash.edu
 
 All good in backend
 
-/api/parking/live-latest
+live-latest：/api/parking
 
 
 
