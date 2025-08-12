@@ -16,10 +16,10 @@ const pool = mysql.createPool({
 
 /* ========= 常量：表名 ========= */
 const SENSOR_TABLE = "city_data.stg_bay_sensors_raw";
-const BAYS_TABLE   = "city_data.stg_parking_bays_raw";
-const ABS_PLACE    = "city_data.stg_abs_place_wide";
-const ABS_VIC      = "city_data.stg_abs_vic_wide";
-const ABS_CHANGE   = "city_data.stg_abs_state_change_raw";
+const BAYS_TABLE = "city_data.stg_parking_bays_raw";
+const ABS_PLACE = "city_data.stg_abs_place_wide";
+const ABS_VIC = "city_data.stg_abs_vic_wide";
+const ABS_CHANGE = "city_data.stg_abs_state_change_raw";
 
 /* ========= 小工具 ========= */
 function toNum(x) {
@@ -93,7 +93,7 @@ function mapParkingRow(r) {
   const latNum = r.lat != null ? Number(r.lat) : null;
   const lonNum = r.lon != null ? Number(r.lon) : null;
   const realId = r.kerbsideid ? String(r.kerbsideid) : null;
-  const pseudo  = makePseudoId(latNum, lonNum);
+  const pseudo = makePseudoId(latNum, lonNum);
 
   const unocc = normalizeUnoccupied(r.raw_status);
   const occ = (unocc == null) ? null : !unocc;
@@ -191,7 +191,7 @@ async function getHistoryByBay(bayId, { start, end, limit = 5000 } = {}) {
       Number((pair.lon + eps).toFixed(6)),
     ];
     if (start) { sql += ` AND STR_TO_DATE(SUBSTRING_INDEX(t.lastupdated,'+',1),'%Y-%m-%dT%H:%i:%s') >= ?`; params.push(start); }
-    if (end)   { sql += ` AND STR_TO_DATE(SUBSTRING_INDEX(t.lastupdated,'+',1),'%Y-%m-%dT%H:%i:%s') <= ?`; params.push(end); }
+    if (end) { sql += ` AND STR_TO_DATE(SUBSTRING_INDEX(t.lastupdated,'+',1),'%Y-%m-%dT%H:%i:%s') <= ?`; params.push(end); }
     sql += ` ORDER BY STR_TO_DATE(SUBSTRING_INDEX(t.lastupdated,'+',1),'%Y-%m-%dT%H:%i:%s') ASC LIMIT ${lim}`;
     const [rows] = await pool.query(sql, params);
     return rows.map(mapParkingRow);
@@ -204,7 +204,7 @@ async function getHistoryByBay(bayId, { start, end, limit = 5000 } = {}) {
   `;
   const params = [bayId];
   if (start) { sql += ` AND ${tsExpr()} >= ?`; params.push(start); }
-  if (end)   { sql += ` AND ${tsExpr()} <= ?`; params.push(end); }
+  if (end) { sql += ` AND ${tsExpr()} <= ?`; params.push(end); }
   sql += ` ORDER BY ${tsExpr()} ASC LIMIT ${lim}`;
   const [rows] = await pool.query(sql, params);
   return rows.map(mapParkingRow);
@@ -216,7 +216,7 @@ async function getRange(start, end, { limit = 100000 } = {}) {
   let sql = `${baseSelect()}`;
   const params = [];
   if (start) { sql += ` AND ${tsExpr()} >= ?`; params.push(start); }
-  if (end)   { sql += ` AND ${tsExpr()} <= ?`; params.push(end); }
+  if (end) { sql += ` AND ${tsExpr()} <= ?`; params.push(end); }
   sql += ` ORDER BY ${tsExpr()} ASC LIMIT ${lim}`;
   const [rows] = await pool.query(sql, params);
   return rows.map(mapParkingRow);
@@ -298,7 +298,9 @@ async function fetchLiveLatest({ limit = 2000, url, token } = {}) {
       const { lat, lon } = extractLatLon(r);
       if (lat == null || lon == null) continue;
 
-      const rawStatus = firstOf(r, ["Zone_Number", "zone_number", "Status", "status", "Status_Description", "status_description"]);
+      const STATUS_KEYS = ["Status_Description", "status_description", "Status", "status", "Zone_Number", "zone_number"];
+      const rawStatus = firstOf(r, STATUS_KEYS);
+
       const unocc = normalizeUnoccupied(rawStatus);
       const occ = unocc == null ? null : !unocc;
 
@@ -339,7 +341,9 @@ async function fetchLiveLatest({ limit = 2000, url, token } = {}) {
         const { lat, lon } = extractLatLon(r);
         if (lat == null || lon == null) continue;
 
-        const rawStatus = firstOf(r, ["Zone_Number", "zone_number", "Status", "status", "Status_Description", "status_description"]);
+        const STATUS_KEYS = ["Status_Description", "status_description", "Status", "status", "Zone_Number", "zone_number"];
+        const rawStatus = firstOf(r, STATUS_KEYS);
+
         const unocc = normalizeUnoccupied(rawStatus);
         const occ = unocc == null ? null : !unocc;
 
@@ -371,7 +375,9 @@ async function fetchLiveLatest({ limit = 2000, url, token } = {}) {
   for (const r of (Array.isArray(arr) ? arr : (arr.results || arr.data || []))) {
     const { lat, lon } = extractLatLon(r);
     if (lat == null || lon == null) continue;
-    const rawStatus = firstOf(r, ["Zone_Number", "zone_number", "Status", "status", "Status_Description", "status_description"]);
+    const STATUS_KEYS = ["Status_Description", "status_description", "Status", "status", "Zone_Number", "zone_number"];
+    const rawStatus = firstOf(r, STATUS_KEYS);
+
     const unocc = normalizeUnoccupied(rawStatus);
     const occ = unocc == null ? null : !unocc;
 
@@ -505,6 +511,6 @@ module.exports = {
   // 指标
   metricsCbdPopulation,
   metricsCarOwnership,
-// 新增：实时直连，最新 N 条
+  // 新增：实时直连，最新 N 条
   fetchLiveLatest,
 };
