@@ -230,13 +230,50 @@ async function getRange(start, end, { limit = 100000 } = {}) {
  * =================================================================================== */
 // 兼容 Socrata(/resource) 和 Explore v2.1(/api/explore/v2.1/.../records)
 // 自动分页直到拿到 limit 条（默认 2000）
+
+// 统一从记录里取经纬度：字段优先，否则从 Location 或 Status_Description 文本里扒
+function extractLatLon(r) {
+  const firstOf = (obj, keys) => {
+    for (const k of keys) if (obj?.[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== "") return obj[k];
+    return null;
+  };
+
+  // 1) 明确字段
+  let lat = firstOf(r, ["lat", "latitude", "Latitude"]);
+  let lon = firstOf(r, ["lon", "longitude", "Longitude"]);
+
+  // 2) Location 字段（字符串 "lat, lon" 或对象）
+  if ((lat == null || lon == null) && (r.Location || r.location)) {
+    const loc = r.Location ?? r.location;
+    if (typeof loc === "string") {
+      const m = loc.match(/-?\d+(?:\.\d+)?/g) || [];
+      if (m.length >= 2) { lat = Number(m[0]); lon = Number(m[1]); }
+    } else if (typeof loc === "object") {
+      lat = lat ?? Number(loc.lat ?? loc.latitude);
+      lon = lon ?? Number(loc.lon ?? loc.longitude);
+    }
+  }
+
+  // 3) 兜底：从 Status_Description 里正则提取
+  if ((lat == null || lon == null) && r.Status_Description) {
+    const m = String(r.Status_Description).match(/-?\d+(?:\.\d+)?/g) || [];
+    if (m.length >= 2) { lat = Number(m[0]); lon = Number(m[1]); }
+  }
+
+  return {
+    lat: lat != null && isFinite(Number(lat)) ? Number(lat) : null,
+    lon: lon != null && isFinite(Number(lon)) ? Number(lon) : null,
+  };
+}
+
+// ===== 覆盖后的 fetchLiveLatest（统一用 extractLatLon） =====
 async function fetchLiveLatest({ limit = 2000, url, token } = {}) {
   const endpoint = url || process.env.LIVE_PARKING_API_URL;
   if (!endpoint) throw new Error("LIVE_PARKING_API_URL 未配置，且未通过参数提供 url");
 
   const headers = token ? { "X-App-Token": token } : undefined;
 
-  // 工具：从多个备选字段取值
+  // 从多个备选字段取值
   const firstOf = (obj, keys, fb = null) => {
     for (const k of keys) {
       if (obj && obj[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== "") return obj[k];
@@ -244,31 +281,21 @@ async function fetchLiveLatest({ limit = 2000, url, token } = {}) {
     return fb;
   };
 
-  const LAT_RE = /-?\d+\.\d+/g;
   const rows = [];
-
-  // —— 分两种平台分别处理 ——
   const isSocrata = /\/resource\//i.test(endpoint);
   const isExplore = /\/api\/explore\/v2\.1\/.+\/records/i.test(endpoint);
 
   if (isSocrata) {
-    // 一次拉够（Socrata 支持较大 $limit）
     const q = new URL(endpoint);
     q.searchParams.set("$order", q.searchParams.get("$order") || "lastupdated DESC");
     q.searchParams.set("$limit", String(Math.max(1, Math.min(50000, limit))));
+
     const res = await fetch(q.toString(), { headers, timeout: 15000 });
     if (!res.ok) throw new Error(`实时接口请求失败：${res.status} ${res.statusText}`);
-    const raw = await res.json();
-    const arr = Array.isArray(raw) ? raw : (raw.results || raw.data || []);
-    for (const r of arr) {
-      let lat = firstOf(r, ["lat", "latitude", "Latitude"]);
-      let lon = firstOf(r, ["lon", "longitude", "Longitude"]);
-      if ((lat == null || lon == null) && r.Status_Description) {
-        const m = String(r.Status_Description).match(LAT_RE) || [];
-        if (m.length >= 2) { lat = Number(m[0]); lon = Number(m[1]); }
-      }
-      lat = lat != null ? Number(lat) : null;
-      lon = lon != null ? Number(lon) : null;
+    const arr = await res.json();
+
+    for (const r of (Array.isArray(arr) ? arr : (arr.results || arr.data || []))) {
+      const { lat, lon } = extractLatLon(r);
       if (lat == null || lon == null) continue;
 
       const rawStatus = firstOf(r, ["Zone_Number", "zone_number", "Status", "status", "Status_Description", "status_description"]);
@@ -289,7 +316,6 @@ async function fetchLiveLatest({ limit = 2000, url, token } = {}) {
   }
 
   if (isExplore) {
-    // Explore v2.1：limit<=100，需要用 offset 分页
     const perPage = 100;
     let offset = 0;
 
@@ -303,7 +329,6 @@ async function fetchLiveLatest({ limit = 2000, url, token } = {}) {
       if (!res.ok) throw new Error(`实时接口请求失败：${res.status} ${res.statusText}`);
       const raw = await res.json();
 
-      // Explore v2.1 返回通常形如 { results: [ {record:{fields:{...}}} or {fields:{...}} ] }
       const list = Array.isArray(raw?.results)
         ? raw.results.map(x => x?.record?.fields || x?.fields || x)
         : (Array.isArray(raw) ? raw : []);
@@ -311,14 +336,7 @@ async function fetchLiveLatest({ limit = 2000, url, token } = {}) {
       if (!list.length) break;
 
       for (const r of list) {
-        let lat = firstOf(r, ["lat", "latitude", "Latitude"]);
-        let lon = firstOf(r, ["lon", "longitude", "Longitude"]);
-        if ((lat == null || lon == null) && r.Status_Description) {
-          const m = String(r.Status_Description).match(LAT_RE) || [];
-          if (m.length >= 2) { lat = Number(m[0]); lon = Number(m[1]); }
-        }
-        lat = lat != null ? Number(lat) : null;
-        lon = lon != null ? Number(lon) : null;
+        const { lat, lon } = extractLatLon(r);
         if (lat == null || lon == null) continue;
 
         const rawStatus = firstOf(r, ["Zone_Number", "zone_number", "Status", "status", "Status_Description", "status_description"]);
@@ -337,22 +355,41 @@ async function fetchLiveLatest({ limit = 2000, url, token } = {}) {
       }
 
       offset += perPage;
-      if (list.length < perPage) break; // 没有更多了
+      if (list.length < perPage) break;
     }
     return rows;
   }
 
-  // 既不是 /resource 也不是 /api/explore，按 Socrata 参数兜底
+  // 兜底：按 Socrata 风格参数
   const q = new URL(endpoint);
   q.searchParams.set("$order", q.searchParams.get("$order") || "lastupdated DESC");
   q.searchParams.set("$limit", String(Math.max(1, Math.min(50000, limit))));
   const res = await fetch(q.toString(), { headers, timeout: 15000 });
   if (!res.ok) throw new Error(`实时接口请求失败：${res.status} ${res.statusText}`);
-  const raw = await res.json();
-  const arr = Array.isArray(raw) ? raw : (raw.results || raw.data || []);
-  // …可以复用上面的映射逻辑，这里省略，按需贴过来
-  return arr.slice(0, limit);
+  const arr = await res.json();
+
+  for (const r of (Array.isArray(arr) ? arr : (arr.results || arr.data || []))) {
+    const { lat, lon } = extractLatLon(r);
+    if (lat == null || lon == null) continue;
+    const rawStatus = firstOf(r, ["Zone_Number", "zone_number", "Status", "status", "Status_Description", "status_description"]);
+    const unocc = normalizeUnoccupied(rawStatus);
+    const occ = unocc == null ? null : !unocc;
+
+    rows.push({
+      bayId: String(firstOf(r, ["KerbsideID", "kerbsideid", "bay_id", "bayId"]) || makePseudoId(lat, lon)),
+      unoccupied: unocc,
+      occupied: occ,
+      lat, lon,
+      lastupdated: firstOf(r, ["Lastupdated", "lastupdated", "status_timestamp", "status_time", "updated", "update_time"]) || null,
+      timestamp: new Date().toISOString(),
+    });
+    if (rows.length >= limit) break;
+  }
+  return rows;
 }
+
+
+
 
 
 
