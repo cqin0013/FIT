@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-/* ------------ 小工具：解析查询参数 ------------ */
+/*小工具：解析查询参数  */
 function parseLatLonCsv(s) {
   if (!s) return null;
   const m = String(s).match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
@@ -22,7 +22,7 @@ function toBool(v, def = false) {
   return t === "1" || t === "true" || t === "yes";
 }
 
-/* ===================== 仅保留的接口 ===================== */
+/* 仅保留的接口*/
 
 // 1) 表结构（调试）
 app.get("/api/db/describe", async (_req, res) => {
@@ -95,7 +95,7 @@ app.get("/api/db/sample/sensors", async (req, res) => {
   }
 });
 
-/* ===================== 启动 ===================== */
+/* 启动*/
 app.listen(PORT, () => {
   console.log(`🚗 Server is running at http://localhost:${PORT}`);
 });
