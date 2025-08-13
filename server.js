@@ -9,16 +9,17 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-/* ------------ 哈弗辛距离（米） ------------ */
-function haversine(lat1, lon1, lat2, lon2) {
-  const toRad = (d) => (d * Math.PI) / 180;
-  const R = 6371000;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(a));
+/* ------------ 参数解析小工具 ------------ */
+function parseLatLonCsv(s) {
+  if (!s) return null;
+  const m = String(s).match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
+  if (!m) return null;
+  return { lat: Number(m[1]), lon: Number(m[2]) };
+}
+function toBool(v, def = false) {
+  if (v === undefined || v === null || v === "") return def;
+  const t = String(v).toLowerCase();
+  return t === "1" || t === "true" || t === "yes";
 }
 
 /* ===================== 健康检查 ===================== */
@@ -33,7 +34,7 @@ app.get("/api/db-test", async (_req, res) => {
 
 /* ===================== AC 1.1 / AC 1.2（数据库） ===================== */
 
-// AC 1.1：车辆/千人（Victoria 基于 DB）
+// AC 1.1：车辆/千人（Victoria）
 app.get("/api/metrics/car-ownership", async (req, res) => {
   try {
     const from = Number(req.query.from || 2016);
@@ -58,58 +59,45 @@ app.get("/api/metrics/cbd-population", async (req, res) => {
   }
 });
 
-/* ===================== 停车（数据库解析坐标版） ===================== */
+/* ===================== AC 2.1 / AC 2.2 停车（快照 & 历史） ===================== */
 
-// 实时：只读最新 N 条（默认 2000），不做 near/radius 过滤
+/**
+ * AC 2.1：/api/parking
+ * 支持：
+ *   - onlyAvailable=true|false
+ *   - near=lat,lon
+ *   - radius=米（默认 300）
+ *   - limit=条数（默认 2000）
+ *
+ * 数据源：handler.fetchOnce()（已在 handler 内部用 SQL 哈弗辛做范围过滤）
+ */
 app.get("/api/parking", async (req, res) => {
   try {
-    const limit = Number(req.query.limit || 2000);
-    const data = await handler.fetchLiveLatest({ limit });
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: "Server error", detail: e.message });
-  }
-});
+    const onlyAvailable = toBool(req.query.onlyAvailable, false);
+    const near = parseLatLonCsv(req.query.near);          // e.g. "-37.81,144.96"
+    const radius = req.query.radius != null ? Number(req.query.radius) : null; // meters
+    const limit = Math.max(1, Math.min(20000, Number(req.query.limit || 2000)));
 
-
-
-
-
-// 历史
-app.get("/api/parking-history", async (req, res) => {
-  try {
-    const { start, end, date } = req.query;
-    if (date) return res.json(await handler.fetchAllForDate(date));
-    res.json(await handler.getRange(start, end));
-  } catch (e) {
-    res.status(500).json({ error: "Server error", detail: e.message });
-  }
-});
-
-// 平均空位率（按日）——DB 无状态字段，这里只给模板（返回 0/1 比例会无意义），保留接口不强依赖
-app.get("/api/vacancy-stats", async (req, res) => {
-  try {
-    const { start, end } = req.query;
-    const data = await handler.getRange(start, end);
-    const grouped = {};
-    data.forEach((e) => {
-      const d = (e.lastupdated || "").slice(0, 10);
-      (grouped[d] ||= []).push(e.unoccupied === true); // 一律 false/null
+    const rows = await handler.fetchOnce({
+      limit,
+      onlyAvailable,
+      near,     // 传给 handler：有 near+radius 时会在 SQL 中返回 distance_m 并按距离筛选/排序
+      radius
     });
-    const result = Object.entries(grouped).map(([date, list]) => {
-      const vacancyRate = list.filter(Boolean).length / list.length;
-      return { date, averageVacancyRate: Number(vacancyRate.toFixed(3)) };
-    });
-    res.json(result);
+
+    res.json(rows);
   } catch (e) {
     res.status(500).json({ error: "Server error", detail: e.message });
   }
 });
 
-// 单 bay（KerbsideID 基本为 NULL，这里保留接口）
+/**
+ * AC 2.2：/api/bays/:bayId —— 点击某个 Bay（当前状态）
+ * 优先 wrangle 快照，回退 sensors_raw 最新记录
+ */
 app.get("/api/bays/:bayId", async (req, res) => {
   try {
-    const item = await handler.getLatestByBay(req.params.bayId);
+    const item = await handler.getLatestByBay(req.params.bayId, { enrichWithDb: false });
     if (!item) return res.status(404).json({ error: "Not found" });
     res.json(item);
   } catch (e) {
@@ -117,16 +105,47 @@ app.get("/api/bays/:bayId", async (req, res) => {
   }
 });
 
+/* ========== 历史接口（可用于 AC 2.3：Bay 的过去占用情况） ========== */
+
+// /api/bays/:bayId/history?start=YYYY-MM-DD HH:mm:ss&end=YYYY-MM-DD HH:mm:ss
 app.get("/api/bays/:bayId/history", async (req, res) => {
   try {
-    const { start, end } = req.query;
-    const data = await handler.getHistoryByBay(req.params.bayId, { start, end });
-    const series = data.map((d) => ({
+    const { start, end, limit } = req.query;
+    const data = await handler.getHistoryByBay(req.params.bayId, {
+      start, end, limit: Number(limit || 5000), enrichWithDb: false
+    });
+    const series = data.map(d => ({
       timestamp: d.lastupdated,
-      occupiedPercent: d.unoccupied ? 0 : 100,
+      occupiedPercent: d.unoccupied === true ? 0 : 100,
       unoccupied: d.unoccupied,
+      lat: d.lat, lon: d.lon,
     }));
     res.json(series);
+  } catch (e) {
+    res.status(500).json({ error: "Server error", detail: e.message });
+  }
+});
+
+/**
+ * （保留）/api/parking-history
+ * - 兼容旧调用：?date=YYYY-MM-DD  -> 自动转为 start/end
+ * - 或直接传 ?start=...&end=...
+ * 数据源：sensors_raw（历史）
+ */
+app.get("/api/parking-history", async (req, res) => {
+  try {
+    let { start, end, date, limit } = req.query;
+    if (date && !start && !end) {
+      const d = String(date).slice(0, 10);
+      start = `${d} 00:00:00`;
+      end = `${d} 23:59:59`;
+    }
+    const out = await handler.getRange(start || null, end || null, {
+      limit: Number(limit || 100000),
+      onlyKnown: true,
+      enrichWithDb: false
+    });
+    res.json(out);
   } catch (e) {
     res.status(500).json({ error: "Server error", detail: e.message });
   }
