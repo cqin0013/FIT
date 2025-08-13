@@ -1,7 +1,7 @@
 "use strict";
 const mysql = require("mysql2/promise");
 
-/* ========= 连接池 ========= */
+/*连接池*/
 const pool = mysql.createPool({
   host: "city-data-mysql.cjk4ce8mi0r6.ap-southeast-2.rds.amazonaws.com",
   port: 3306,
@@ -12,7 +12,7 @@ const pool = mysql.createPool({
   connectionLimit: 10,
 });
 
-/* ========= 表名 ========= */
+/*表名*/
 const WRANGLE_TABLE = "city_data.wrangle_sensor_bay_data"; // 快照
 const SENSORS_RAW   = "city_data.stg_bay_sensors_raw";     // 历史
 
@@ -21,7 +21,7 @@ const ABS_PLACE  = "city_data.stg_abs_place_wide";
 const ABS_VIC    = "city_data.stg_abs_vic_wide";
 const ABS_CHANGE = "city_data.stg_abs_state_change_raw";
 
-/* ========= 小工具 ========= */
+/* 小工具 */
 function toNum(x){ if(x==null) return null; const n=Number(String(x).replace(/[, ]/g,"")); return Number.isFinite(n)?n:null; }
 const r6 = x => Number(x).toFixed(6);
 
@@ -36,7 +36,7 @@ function normalizeUnoccupied(raw){
   return null;
 }
 
-/* —— 经纬度解析 —— */
+/* 经纬度解析 */
 function extractLatLon(r){
   let lat=null, lon=null;
   const loc = r.location ?? r.Location;
@@ -62,13 +62,13 @@ function extractLatLon(r){
   };
 }
 
-/* —— 从 Location 文本提数（加 TRIM） —— */
+/*从 Location 文本提数（加 TRIM）*/
 const LAT_FROM_LOC = `CAST(TRIM(SUBSTRING_INDEX(Location, ',', 1)) AS DECIMAL(12,6))`;
 const LON_FROM_LOC = `CAST(TRIM(SUBSTRING_INDEX(Location, ',', -1)) AS DECIMAL(13,6))`;
 const LAT_ANY = `COALESCE(${LAT_FROM_LOC}, CAST(TRIM(SUBSTRING_INDEX(Status_Description, ',', 1)) AS DECIMAL(12,6)))`;
 const LON_ANY = `COALESCE(${LON_FROM_LOC}, CAST(TRIM(SUBSTRING_INDEX(Status_Description, ',', -1)) AS DECIMAL(13,6)))`;
 
-/* —— Haversine 距离表达式（把 lat/lon 数值内联，稳定可靠） —— */
+/* Haversine 距离表达式（把 lat/lon 数值内联，稳定可靠） */
 function haversineExprInline(LAT, LON, latExpr = LAT_FROM_LOC, lonExpr = LON_FROM_LOC){
   return `
     2 * 6371000 * ASIN(
@@ -81,7 +81,7 @@ function haversineExprInline(LAT, LON, latExpr = LAT_FROM_LOC, lonExpr = LON_FRO
   `;
 }
 
-/* —— 统一输出结构 —— */
+/*统一输出结构*/
 function rowToRecord(r){
   const {lat,lon} = extractLatLon(r);
   const statusCandidate = firstOf(r, ["status_description","zone_number","Status","status","Status_Description","Zone_Number"]);
@@ -137,7 +137,7 @@ async function fetchOnce({ limit=2000, onlyAvailable=false, near=null, radius=nu
   return rows.map(rowToRecord);
 }
 
-/* —— 附近（内部使用） —— */
+/* 附近（内部使用）*/
 async function fetchNearby({ lat, lon, radius=300, onlyAvailable=false, limit=2000 } = {}){
   if(!Number.isFinite(lat) || !Number.isFinite(lon)) return [];
 
@@ -235,7 +235,7 @@ async function sampleSensors(limit=10){
   return rows;
 }
 
-/* ========= ABS 指标 ========= */
+/*ABS 指标*/
 async function metricsCbdPopulation({ from=2001, to=2021, place="Melbourne City" } = {}){
   const years=[]; for(let y=Number(from); y<=Number(to); y++) years.push(y);
   const yCols=years.map(y=>`y${y}`);
@@ -278,7 +278,7 @@ async function metricsCarOwnership({ from=2016, to=2021 } = {}){
   return { title:"Vehicles change per 1,000 residents (Victoria)", unit:"vehicles / 1,000 residents", source:`${ABS_CHANGE} + ${ABS_VIC}`, series };
 }
 
-/* ========= 导出 ========= */
+/* 导出*/
 module.exports = {
   fetchOnce,
   getLatestByBay,
