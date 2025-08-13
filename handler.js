@@ -3,7 +3,7 @@ const mysql = require("mysql2/promise");
 const fetch = require("node-fetch");
 const cron = require("node-cron");
 
-/* ========= 连接池 ========= */
+/* ========= 连接池（仅用于 ABS 指标 & 富化用 BAYS_TABLE 查询） ========= */
 const pool = mysql.createPool({
   host: "city-data-mysql.cjk4ce8mi0r6.ap-southeast-2.rds.amazonaws.com",
   port: 3306,
@@ -15,11 +15,12 @@ const pool = mysql.createPool({
 });
 
 /* ========= 常量：表名 ========= */
-const SENSOR_TABLE = "city_data.stg_bay_sensors_raw";
-const BAYS_TABLE = "city_data.stg_parking_bays_raw";
-const ABS_PLACE = "city_data.stg_abs_place_wide";
-const ABS_VIC = "city_data.stg_abs_vic_wide";
-const ABS_CHANGE = "city_data.stg_abs_state_change_raw";
+// SENSOR_TABLE/BAYS_TABLE 只用于读；不做写入
+const SENSOR_TABLE = "city_data.stg_bay_sensors_raw";   // 可用于调试/健康检查
+const BAYS_TABLE   = "city_data.stg_parking_bays_raw";  // 用于 KerbsideID 富化
+const ABS_PLACE    = "city_data.stg_abs_place_wide";
+const ABS_VIC      = "city_data.stg_abs_vic_wide";
+const ABS_CHANGE   = "city_data.stg_abs_state_change_raw";
 
 /* ========= 小工具 ========= */
 function toNum(x) {
@@ -39,199 +40,25 @@ function parsePseudoId(id) {
   return { lat: Number(m[1]), lon: Number(m[2]) };
 }
 
-/* ========= 公用 SELECT（join + 正则兜底坐标；正则不含 ?） ========= */
-function baseSelect() {
-  const LAT_RE = "(-|)[0-9]+\\.[0-9]+";
-  const LON_RE = "(-|)[0-9]+\\.[0-9]+";
-  return `
-    SELECT
-      COALESCE(NULLIF(s.KerbsideID,''), b.KerbsideID) AS kerbsideid,
-      s.Lastupdated                                    AS lastupdated,
-      s.Zone_Number                                    AS raw_status,   -- 占用状态真实来源
-      CAST(COALESCE(
-        b.Latitude,
-        REGEXP_SUBSTR(s.Status_Description, '${LAT_RE}', 1, 1)
-      ) AS DECIMAL(12,8))                              AS lat,
-      CAST(COALESCE(
-        b.Longitude,
-        REGEXP_SUBSTR(s.Status_Description, '${LON_RE}', 1, 2)
-      ) AS DECIMAL(12,8))                              AS lon
-    FROM ${SENSOR_TABLE} s
-    LEFT JOIN ${BAYS_TABLE} b
-      ON (
-        b.KerbsideID = s.KerbsideID
-        OR b.RoadSegmentID = CAST(REPLACE(s.Zone_Number, ',', '') AS UNSIGNED)
-      )
-    WHERE COALESCE(
-            b.Latitude, REGEXP_SUBSTR(s.Status_Description, '${LAT_RE}', 1, 1)
-          ) IS NOT NULL
-      AND COALESCE(
-            b.Longitude, REGEXP_SUBSTR(s.Status_Description, '${LON_RE}', 1, 2)
-          ) IS NOT NULL
-  `;
+/* ========= 时间解析（去掉 +10:00 等时区后再解析） ========= */
+function parseLastupdated(ts) {
+  if (!ts) return null;
+  const base = String(ts).split("+")[0].trim(); // "YYYY-MM-DDTHH:mm:ss"
+  const d = new Date(base.replace("T", " ") + "Z"); // 作为 UTC 解析
+  return isNaN(d.getTime()) ? null : d;
 }
 
-// 去掉 +10:00 再转时间，便于排序/过滤
-function tsExpr() {
-  return `STR_TO_DATE(SUBSTRING_INDEX(s.Lastupdated, '+', 1), '%Y-%m-%dT%H:%i:%s')`;
-}
-
-/* ========= 读数映射 ========= */
+/* ========= 占用状态映射 ========= */
 function normalizeUnoccupied(raw) {
   if (raw == null) return null;
   const t = String(raw).trim().toLowerCase();
   if (!t) return null;
-  // 空位
-  if (t.includes("unoccupied") || t.includes("free") || t.includes("vacant")) return true;
-  // 有车
-  if (t.includes("present") || t.includes("occupied")) return false;
-  // 其他未知
-  return null;
+  if (t.includes("unoccupied") || t.includes("free") || t.includes("vacant")) return true;   // 空位
+  if (t.includes("present") || t.includes("occupied")) return false;                          // 有车
+  return null;                                                                                // 未知
 }
 
-function mapParkingRow(r) {
-  const latNum = r.lat != null ? Number(r.lat) : null;
-  const lonNum = r.lon != null ? Number(r.lon) : null;
-  const realId = r.kerbsideid ? String(r.kerbsideid) : null;
-  const pseudo = makePseudoId(latNum, lonNum);
-
-  const unocc = normalizeUnoccupied(r.raw_status);
-  const occ = (unocc == null) ? null : !unocc;
-
-  return {
-    bayId: realId || pseudo,
-    // 注意：两个字段都给，前端可任选其一；你的现有前端在用 unoccupied，就继续用它
-    unoccupied: unocc,              // true=空位, false=占用, null=未知
-    occupied: occ,                  // true=占用, false=空位, null=未知
-    lat: latNum,
-    lon: lonNum,
-    lastupdated: r.lastupdated || null,
-    timestamp: new Date().toISOString(),
-  };
-}
-
-/* ===================================================================================
- * A. 核心读取：停车（仅读库）
- * =================================================================================== */
-async function fetchOnce({ limit = 2000 } = {}) {
-  const lim = Number.isFinite(limit) ? Math.max(1, Math.min(10000, limit)) : 2000;
-  const sql = `
-    ${baseSelect()}
-    ORDER BY ${tsExpr()} DESC
-    LIMIT ${lim}
-  `;
-  const [rows] = await pool.query(sql);
-  return rows.map(mapParkingRow);
-}
-
-async function fetchAllForDate(date, { limitPerDay = 50000 } = {}) {
-  const lim = Number.isFinite(limitPerDay) ? Math.max(1, Math.min(200000, limitPerDay)) : 50000;
-  const sql = `
-    ${baseSelect()}
-    AND LEFT(s.Lastupdated, 10) = ?
-    ORDER BY ${tsExpr()} ASC
-    LIMIT ${lim}
-  `;
-  const [rows] = await pool.query(sql, [date]);
-  return rows.map(mapParkingRow);
-}
-
-/* ========= 单 bay（支持伪 bayId 与真实 KerbsideID） ========= */
-async function getLatestByBay(bayId) {
-  const pair = parsePseudoId(bayId);
-  if (pair) {
-    const eps = 0.000005; // 约等于四米级别
-    const sql = `
-      SELECT * FROM (
-        ${baseSelect()}
-      ) t
-      WHERE t.lat BETWEEN ? AND ?
-        AND t.lon BETWEEN ? AND ?
-      ORDER BY STR_TO_DATE(SUBSTRING_INDEX(t.lastupdated,'+',1), '%Y-%m-%dT%H:%i:%s') DESC
-      LIMIT 1
-    `;
-    const params = [
-      Number((pair.lat - eps).toFixed(6)),
-      Number((pair.lat + eps).toFixed(6)),
-      Number((pair.lon - eps).toFixed(6)),
-      Number((pair.lon + eps).toFixed(6)),
-    ];
-    const [rows] = await pool.query(sql, params);
-    return rows.length ? mapParkingRow(rows[0]) : null;
-  }
-
-  // 真实 KerbsideID
-  const sql = `
-    ${baseSelect()}
-    AND COALESCE(NULLIF(s.KerbsideID,''), b.KerbsideID) = ?
-    ORDER BY ${tsExpr()} DESC
-    LIMIT 1
-  `;
-  const [rows] = await pool.query(sql, [bayId]);
-  return rows.length ? mapParkingRow(rows[0]) : null;
-}
-
-async function getHistoryByBay(bayId, { start, end, limit = 5000 } = {}) {
-  const lim = Number.isFinite(limit) ? Math.max(1, Math.min(100000, limit)) : 5000;
-  const pair = parsePseudoId(bayId);
-
-  if (pair) {
-    const eps = 0.000005;
-    let sql = `
-      SELECT * FROM (
-        ${baseSelect()}
-      ) t
-      WHERE t.lat BETWEEN ? AND ?
-        AND t.lon BETWEEN ? AND ?
-    `;
-    const params = [
-      Number((pair.lat - eps).toFixed(6)),
-      Number((pair.lat + eps).toFixed(6)),
-      Number((pair.lon - eps).toFixed(6)),
-      Number((pair.lon + eps).toFixed(6)),
-    ];
-    if (start) { sql += ` AND STR_TO_DATE(SUBSTRING_INDEX(t.lastupdated,'+',1),'%Y-%m-%dT%H:%i:%s') >= ?`; params.push(start); }
-    if (end) { sql += ` AND STR_TO_DATE(SUBSTRING_INDEX(t.lastupdated,'+',1),'%Y-%m-%dT%H:%i:%s') <= ?`; params.push(end); }
-    sql += ` ORDER BY STR_TO_DATE(SUBSTRING_INDEX(t.lastupdated,'+',1),'%Y-%m-%dT%H:%i:%s') ASC LIMIT ${lim}`;
-    const [rows] = await pool.query(sql, params);
-    return rows.map(mapParkingRow);
-  }
-
-  // 真实 KerbsideID
-  let sql = `
-    ${baseSelect()}
-    AND COALESCE(NULLIF(s.KerbsideID,''), b.KerbsideID) = ?
-  `;
-  const params = [bayId];
-  if (start) { sql += ` AND ${tsExpr()} >= ?`; params.push(start); }
-  if (end) { sql += ` AND ${tsExpr()} <= ?`; params.push(end); }
-  sql += ` ORDER BY ${tsExpr()} ASC LIMIT ${lim}`;
-  const [rows] = await pool.query(sql, params);
-  return rows.map(mapParkingRow);
-}
-
-/* ========= 时间窗 ========= */
-async function getRange(start, end, { limit = 100000 } = {}) {
-  const lim = Number.isFinite(limit) ? Math.max(1, Math.min(200000, limit)) : 100000;
-  let sql = `${baseSelect()}`;
-  const params = [];
-  if (start) { sql += ` AND ${tsExpr()} >= ?`; params.push(start); }
-  if (end) { sql += ` AND ${tsExpr()} <= ?`; params.push(end); }
-  sql += ` ORDER BY ${tsExpr()} ASC LIMIT ${lim}`;
-  const [rows] = await pool.query(sql, params);
-  return rows.map(mapParkingRow);
-}
-
-
-/* ===================================================================================
- * 实时版（精简）：只取最新 limit 条（默认 2000），不做距离过滤
- * 来源：LIVE_PARKING_API_URL（可用参数 url 覆盖），LIVE_PARKING_API_TOKEN 可选
- * 返回结构与 mapParkingRow 一致：{ bayId, unoccupied, occupied, lat, lon, lastupdated, timestamp }
- * =================================================================================== */
-// 兼容 Socrata(/resource) 和 Explore v2.1(/api/explore/v2.1/.../records)
-// 自动分页直到拿到 limit 条（默认 2000）
-
-// 统一从记录里取经纬度：字段优先，否则从 Location 或 Status_Description 文本里扒
+/* ========= 统一从记录里取经纬度 ========= */
 function extractLatLon(r) {
   const firstOf = (obj, keys) => {
     for (const k of keys) if (obj?.[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== "") return obj[k];
@@ -266,14 +93,15 @@ function extractLatLon(r) {
   };
 }
 
-// ===== 覆盖后的 fetchLiveLatest（统一用 extractLatLon） =====
+/* ===================================================================================
+ * 实时抓取（政府数据源）
+ * =================================================================================== */
 async function fetchLiveLatest({ limit = 2000, url, token } = {}) {
   const endpoint = url || process.env.LIVE_PARKING_API_URL;
   if (!endpoint) throw new Error("LIVE_PARKING_API_URL 未配置，且未通过参数提供 url");
 
   const headers = token ? { "X-App-Token": token } : undefined;
 
-  // 从多个备选字段取值
   const firstOf = (obj, keys, fb = null) => {
     for (const k of keys) {
       if (obj && obj[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== "") return obj[k];
@@ -394,16 +222,282 @@ async function fetchLiveLatest({ limit = 2000, url, token } = {}) {
   return rows;
 }
 
+/* ===================================================================================
+ * 进程内缓存（TTL + SWR）并累计历史（环形缓冲）
+ * =================================================================================== */
+const DEFAULT_TTL_MS = Number(process.env.CACHE_TTL_MS || 60_000);     // 新鲜度
+const DEFAULT_SWR_MS = Number(process.env.CACHE_SWR_MS || 5 * 60_000); // SWR 窗口
+const MAX_HISTORY    = Number(process.env.CACHE_MAX_HISTORY || 500_000);
 
+const _cache = {
+  latestBatchTime: 0,   // 最近一次成功拉取时刻（ms）
+  refreshing: false,
+  items: [],            // 历史累计记录（环形缓冲）
+  keyset: new Set(),    // 去重：key = bayId + "|" + lastupdated
+};
 
+// 去重 key
+function _recKey(r) {
+  const lu = r.lastupdated || "";
+  return `${r.bayId}|${lu}`;
+}
 
+// 批量合并到历史缓存（去重 & 控制容量）
+function _mergeIntoHistory(list) {
+  for (const r of list) {
+    if (!r || !r.bayId) continue;
+    const k = _recKey(r);
+    if (_cache.keyset.has(k)) continue;
+    _cache.items.push(r);
+    _cache.keyset.add(k);
+  }
+  // 控制容量
+  if (_cache.items.length > MAX_HISTORY) {
+    const overflow = _cache.items.length - MAX_HISTORY;
+    const removed = _cache.items.splice(0, overflow);
+    for (const r of removed) _cache.keyset.delete(_recKey(r));
+  }
+}
 
+// 主动刷新（可 force）
+async function refreshLiveCache({ limit = 2000, url, token, force = false } = {}) {
+  const now = Date.now();
+  const isFresh = (now - _cache.latestBatchTime) <= DEFAULT_TTL_MS;
+  const withinSWR = (now - _cache.latestBatchTime) <= DEFAULT_SWR_MS;
 
+  if (!force && (isFresh || (withinSWR && _cache.refreshing))) {
+    return { refreshed: false, items: _cache.items.length };
+  }
+  if (_cache.refreshing) {
+    return { refreshed: false, items: _cache.items.length };
+  }
 
+  _cache.refreshing = true;
+  try {
+    const batch = await fetchLiveLatest({ limit, url, token });
+    _mergeIntoHistory(batch);
+    _cache.latestBatchTime = Date.now();
+    return { refreshed: true, batch: batch.length, total: _cache.items.length };
+  } finally {
+    _cache.refreshing = false;
+  }
+}
 
+// 清缓存
+function clearParkingCache() {
+  _cache.items = [];
+  _cache.keyset.clear();
+  _cache.latestBatchTime = 0;
+  _cache.refreshing = false;
+  return true;
+}
+
+// 确保在 TTL 内，如不新鲜且超出 SWR 就同步刷新
+async function _ensureFreshSync() {
+  const now = Date.now();
+  const isFresh = (now - _cache.latestBatchTime) <= DEFAULT_TTL_MS;
+  const withinSWR = (now - _cache.latestBatchTime) <= DEFAULT_SWR_MS;
+  if (isFresh) return;
+  if (withinSWR) {
+    // SWR 内：先返回旧数据；后台刷新
+    refreshLiveCache({}).catch(() => {});
+    return;
+  }
+  // 超过 SWR：同步刷新
+  await refreshLiveCache({});
+}
 
 /* ===================================================================================
- * B. 其它保留的辅助
+ * 富化：根据 KerbsideID 批量查库并合并到 meta
+ * =================================================================================== */
+async function getBayMetaMapByKerbsideIds(ids = []) {
+  // 过滤掉伪 ID（"lat,lon"）
+  const realIds = [...new Set(ids.filter(id => id && !parsePseudoId(id)))];
+  if (!realIds.length) return new Map();
+
+  const placeholders = realIds.map(() => "?").join(",");
+  const sql = `
+    SELECT KerbsideID, Latitude, Longitude, RoadSegmentID
+    FROM ${BAYS_TABLE}
+    WHERE KerbsideID IN (${placeholders})
+  `;
+  const [rows] = await pool.query(sql, realIds);
+  const m = new Map();
+  for (const r of rows) {
+    const id = String(r.KerbsideID);
+    m.set(id, {
+      kerbsideId: id,
+      lat: r.Latitude != null ? Number(r.Latitude) : null,
+      lon: r.Longitude != null ? Number(r.Longitude) : null,
+      roadSegmentId: r.RoadSegmentID != null ? Number(r.RoadSegmentID) : null,
+    });
+  }
+  return m;
+}
+
+function mergeBayMeta(rows = [], metaMap = new Map()) {
+  return rows.map(r => {
+    const meta = r?.bayId ? metaMap.get(String(r.bayId)) : undefined;
+    return {
+      ...r,
+      meta: meta || null,  // { kerbsideId, lat, lon, roadSegmentId } | null
+    };
+  });
+}
+
+/* ===================================================================================
+ * 查询接口（全部基于缓存）—— 支持 enrichWithDb
+ * =================================================================================== */
+
+// 最新列表（默认 2000）
+async function fetchOnce({ limit = 2000, enrichWithDb = false } = {}) {
+  await _ensureFreshSync();
+  const lim = Number.isFinite(limit) ? Math.max(1, Math.min(10000, limit)) : 2000;
+
+  const sorted = [..._cache.items].sort((a, b) => {
+    const da = parseLastupdated(a.lastupdated)?.getTime() ?? 0;
+    const db = parseLastupdated(b.lastupdated)?.getTime() ?? 0;
+    return db - da;
+  });
+  let out = sorted.slice(0, lim);
+
+  if (enrichWithDb && out.length) {
+    const metas = await getBayMetaMapByKerbsideIds(out.map(x => x.bayId));
+    out = mergeBayMeta(out, metas);
+  }
+  return out;
+}
+
+// 单 bay 最新（支持伪 bayId）
+async function getLatestByBay(bayId, { enrichWithDb = false } = {}) {
+  await _ensureFreshSync();
+  const pair = parsePseudoId(bayId);
+
+  let latest = null;
+  if (pair) {
+    const eps = 0.000005; // 约四米
+    const matches = _cache.items.filter(t =>
+      t.lat != null && t.lon != null &&
+      t.lat >= Number((pair.lat - eps).toFixed(6)) &&
+      t.lat <= Number((pair.lat + eps).toFixed(6)) &&
+      t.lon >= Number((pair.lon - eps).toFixed(6)) &&
+      t.lon <= Number((pair.lon + eps).toFixed(6))
+    );
+    if (matches.length) {
+      matches.sort((a, b) => (parseLastupdated(b.lastupdated)?.getTime() ?? 0) - (parseLastupdated(a.lastupdated)?.getTime() ?? 0));
+      latest = matches[0];
+    }
+  } else {
+    const matches = _cache.items.filter(t => t.bayId === String(bayId));
+    if (matches.length) {
+      matches.sort((a, b) => (parseLastupdated(b.lastupdated)?.getTime() ?? 0) - (parseLastupdated(a.lastupdated)?.getTime() ?? 0));
+      latest = matches[0];
+    }
+  }
+
+  if (!latest) return null;
+
+  if (enrichWithDb && latest.bayId && !parsePseudoId(latest.bayId)) {
+    const metas = await getBayMetaMapByKerbsideIds([latest.bayId]);
+    return mergeBayMeta([latest], metas)[0];
+  }
+  return latest;
+}
+
+// 单 bay 历史（可加时间窗）
+async function getHistoryByBay(bayId, { start, end, limit = 5000, enrichWithDb = false } = {}) {
+  await _ensureFreshSync();
+  const lim = Number.isFinite(limit) ? Math.max(1, Math.min(100000, limit)) : 5000;
+  const pair = parsePseudoId(bayId);
+
+  let list = [];
+  if (pair) {
+    const eps = 0.000005;
+    list = _cache.items.filter(t =>
+      t.lat != null && t.lon != null &&
+      t.lat >= Number((pair.lat - eps).toFixed(6)) &&
+      t.lat <= Number((pair.lat + eps).toFixed(6)) &&
+      t.lon >= Number((pair.lon - eps).toFixed(6)) &&
+      t.lon <= Number((pair.lon + eps).toFixed(6))
+    );
+  } else {
+    list = _cache.items.filter(t => t.bayId === String(bayId));
+  }
+
+  const startMs = start ? (parseLastupdated(start)?.getTime() ?? Date.parse(start)) : null;
+  const endMs   = end   ? (parseLastupdated(end)?.getTime()   ?? Date.parse(end))   : null;
+  if (startMs != null) list = list.filter(t => (parseLastupdated(t.lastupdated)?.getTime() ?? 0) >= startMs);
+  if (endMs   != null) list = list.filter(t => (parseLastupdated(t.lastupdated)?.getTime() ?? 0) <= endMs);
+
+  list.sort((a, b) => (parseLastupdated(a.lastupdated)?.getTime() ?? 0) - (parseLastupdated(b.lastupdated)?.getTime() ?? 0));
+  let out = list.slice(0, lim);
+
+  if (enrichWithDb && out.length) {
+    const metas = await getBayMetaMapByKerbsideIds(out.map(x => x.bayId));
+    out = mergeBayMeta(out, metas);
+  }
+  return out;
+}
+
+/**
+ * 时间/范围查询
+ * @param {string|null} start
+ * @param {string|null} end
+ * @param {object} opts
+ *   - limit: 默认 100000
+ *   - bbox: { minLat, maxLat, minLon, maxLon }
+ *   - onlyKnown: 默认 true
+ *   - enrichWithDb: 默认 false
+ */
+async function getRange(start, end, { limit = 100000, bbox, onlyKnown = true, enrichWithDb = false } = {}) {
+  await _ensureFreshSync();
+  const lim = Number.isFinite(limit) ? Math.max(1, Math.min(200000, limit)) : 100000;
+
+  let list = _cache.items;
+
+  const startMs = start ? (parseLastupdated(start)?.getTime() ?? Date.parse(start)) : null;
+  const endMs   = end   ? (parseLastupdated(end)?.getTime()   ?? Date.parse(end))   : null;
+  if (startMs != null) list = list.filter(t => (parseLastupdated(t.lastupdated)?.getTime() ?? 0) >= startMs);
+  if (endMs   != null) list = list.filter(t => (parseLastupdated(t.lastupdated)?.getTime() ?? 0) <= endMs);
+
+  if (bbox && [bbox.minLat, bbox.maxLat, bbox.minLon, bbox.maxLon].every(v => typeof v === "number")) {
+    list = list.filter(t =>
+      t.lat != null && t.lon != null &&
+      t.lat >= bbox.minLat && t.lat <= bbox.maxLat &&
+      t.lon >= bbox.minLon && t.lon <= bbox.maxLon
+    );
+  } else if (onlyKnown) {
+    list = list.filter(t => t.lat != null && t.lon != null);
+  }
+
+  list = [...list].sort((a, b) => (parseLastupdated(a.lastupdated)?.getTime() ?? 0) - (parseLastupdated(b.lastupdated)?.getTime() ?? 0));
+  let out = list.slice(0, lim);
+
+  if (enrichWithDb && out.length) {
+    const metas = await getBayMetaMapByKerbsideIds(out.map(x => x.bayId));
+    out = mergeBayMeta(out, metas);
+  }
+  return out;
+}
+
+/* ===================================================================================
+ * 定时刷新缓存（取代原“写库”CRON）
+ * =================================================================================== */
+cron.schedule("*/5 * * * *", async () => {
+  try {
+    const ret = await refreshLiveCache({ limit: Number(process.env.LIVE_PULL_LIMIT || 2000) });
+    if (ret.refreshed) {
+      console.log(`⏱ CRON: 刷新缓存 batch=${ret.batch}, total=${ret.total}`);
+    } else {
+      console.log(`⏱ CRON: 缓存新鲜 / 或已在刷新中, total=${_cache.items.length}`);
+    }
+  } catch (e) {
+    console.error("CRON 刷新失败：", e.message);
+  }
+});
+
+/* ===================================================================================
+ * 健康/调试 & ABS 指标（仍使用数据库）
  * =================================================================================== */
 async function dbPing() { const [r] = await pool.query("SELECT 1 AS ok"); return r[0].ok === 1; }
 async function describeSensorTable() {
@@ -433,17 +527,7 @@ async function rawMinMaxCount() {
   return { count: Number(r1[0].c || 0), minLastupdated: r2[0].minlu || null, maxLastupdated: r2[0].maxlu || null };
 }
 
-/* ========= 摄取相关（no-op） ========= */
-const ingestLog = [];
-function pushIngestLog(entry) { ingestLog.push({ time: new Date().toISOString(), ...entry }); if (ingestLog.length > 100) ingestLog.shift(); }
-function getIngestLog() { return ingestLog; }
-async function ingestOnce() { pushIngestLog({ inserted: 0, tookMs: 0, reason: "no-op" }); return { inserted: 0, tookMs: 0 }; }
-async function ensureFreshIngest({ ttlSec = 90 } = {}) { return await ingestOnce(); }
-cron.schedule("*/5 * * * *", async () => { try { const ret = await ingestOnce(); console.log(`⏱ CRON: 插入 ${ret.inserted} 行`); } catch (e) { console.error("CRON 失败：", e.message); } });
-
-/* ===================================================================================
- * C. AC 指标
- * =================================================================================== */
+/* ========= ABS 指标 ========= */
 async function metricsCbdPopulation({ from = 2001, to = 2021, place = "Melbourne City" } = {}) {
   const years = []; for (let y = Number(from); y <= Number(to); y++) years.push(y);
   const yCols = years.map(y => `y${y}`);
@@ -488,29 +572,30 @@ async function metricsCarOwnership({ from = 2016, to = 2021 } = {}) {
 
 /* ========= 导出 ========= */
 module.exports = {
-  // 停车
+  // 停车（缓存+SWR）
   fetchOnce,
-  fetchAllForDate,
   getLatestByBay,
   getHistoryByBay,
   getRange,
 
-  // 健康/调试
+  // 缓存控制
+  refreshLiveCache,
+  clearParkingCache,
+
+  // 富化工具（可选导出）
+  getBayMetaMapByKerbsideIds,
+  mergeBayMeta,
+
+  // 健康/调试 & 指标
   dbPing,
   describeSensorTable,
   countSensors,
   maxLastupdated,
   sampleSensors,
   rawMinMaxCount,
-  getIngestLog,
-
-  // 摄取（no-op）
-  ingestOnce,
-  ensureFreshIngest,
-
-  // 指标
   metricsCbdPopulation,
   metricsCarOwnership,
-  // 新增：实时直连，最新 N 条
+
+  // 可选对外：底层抓取函数
   fetchLiveLatest,
 };
