@@ -1,0 +1,41 @@
+/* Chart area container */
+.insight-chart-wrap {
+  width: min(96vw, 1200px);
+  margin: 0 auto;
+  padding: 0 12px;
+}
+
+/* Responsive canvas (Chart.js scales to container) */
+.insight-canvas {
+  display: block;
+  width: 100%;
+  margin-top: 12px;
+}
+
+/* Actions */
+.insight-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0 12px;
+}
+.insight-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 10px 14px;
+  border: 1px solid #111827;
+  border-radius: 12px;
+    background: #fff;
+    color: #111827;
+    font-weight: 700;
+    text-decoration: none;
+    cursor: pointer;
+    transition: background .15s ease;
+}
+.insight-btn:hover {
+  background: #f8fafc;
+}
+
+.insight-btn:active {
+  transform: translateY(1px);
+}

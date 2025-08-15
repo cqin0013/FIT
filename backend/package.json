@@ -1,0 +1,29 @@
+{
+  "name": "parking-sensor-reader",
+  "version": "1.0.0",
+  "description": "Periodically poll parking sensor data in Melbourne City",
+  "main": "handler.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "build": "echo skip"
+  },
+  "dependencies": {
+    "@elastic/elasticsearch": "^7.9.1",
+    "cors": "^2.8.5",
+    "cron": "^4.3.3",
+    "express": "^5.1.0",
+    "node-cron": "^4.2.1",
+    "node-fetch": "^2.7.0",
+    "mysql2": "^3.11.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github.com/cqin0013/FIT.git"
+  },
+  "author": "",
+  "license": "ISC"
+}

@@ -1,0 +1,85 @@
+/* Design Tokens*/
+:root {
+  /* Color & shadow tokens used across the app */
+    --ds-border: #cfd6e0;
+    --ds-border-2: #e5e7eb;
+    --ds-text: #111827;
+    --ds-bg: #fff;
+    --ds-thead: #f5f7fa;
+    --ds-hover: #f9fafb;
+    --ds-shadow: 0 10px 28px rgba(0, 0, 0, .07);
+  
+    /* Accents */
+    --muted-color: #6b7280;
+    --focus-color: #3b82f6;
+    /* Focus ring color */
+}
+
+/*  Base Reset */
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/* Prevent iOS automatic text zoom */
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+/* Media should not overflow containers */
+img,
+svg,
+video,
+canvas {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
+/* Form controls inherit base font & color (actual font/color set in typography.css) */
+input,
+button,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+/* Remove tap highlight on touch devices */
+a,
+button {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Accessible keyboard focus outline */
+:focus-visible {
+  outline: 2px solid var(--focus-color);
+  outline-offset: 2px;
+}
+
+/* Text selection color */
+::selection {
+  background: rgba(59, 130, 246, 0.2);
+  /* #3b82f6 @ 20% */
+}
+
+/* Respect users who prefer reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Smooth scrolling by default (disabled above for reduced motion) */
+html {
+  scroll-behavior: smooth;
+}

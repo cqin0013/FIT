@@ -1,0 +1,58 @@
+/* Page container */
+.data-source-page {
+  padding: 2rem 1rem;
+}
+
+/* Header container */
+.data-source-header,
+.data-source-card {
+  max-width: 1240px;
+  margin: auto;
+}
+/* Title & subtitle */
+.ds-title {
+  font-weight: 700;
+}
+.ds-sub {
+  /*try mute color*/
+  color: var(--muted-color, gray);
+    
+}
+
+/* List layout */
+.data-source-list {
+  display: grid;
+    gap: 1.5rem;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+}
+
+@media (max-width: 420px) {
+  .data-source-list {
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  }
+}
+
+/* Card */
+.data-source-item {
+  background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+  padding: 1rem;
+    /*animate*/
+    transition: transform .2s, box-shadow .2s;
+    
+}
+
+.data-source-item:hover {
+  /*animate*/
+  transform: translateY(-4px);
+    
+}
+
+/* Typography inside cards */
+.data-source-item h3 {
+  font-weight: 700;
+}
+.data-source-item p {
+  color: var(--muted-color, #555);
+}
